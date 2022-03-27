@@ -1,0 +1,305 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(tigris)
+library(viridis)
+library(keyring)
+library(lubridate)
+#key_set("CENSUS_API_KEY_SECURE")
+#my_census_key <- key_get("CENSUS_API_KEY_SECURE")
+```
+
+```{r}
+crime_19 <- read_csv("./Crime_Incidents_in_2019.csv")
+crime_20 <- read_csv("./Crime_Incidents_in_2020.csv")
+crime_20 %>% 
+  mutate(CCN = parse_double(CCN)) -> crime_20
+bind_rows(crime_19, crime_20) -> full_df
+
+full_df %>% 
+  separate(col = REPORT_DAT, into = c("crime_date", "crime_hour"), sep = " ") %>%
+  mutate(crime_date = parse_date(crime_date, "%Y/%m/%d")) %>% 
+  mutate(crime_hour = parse_time(crime_hour, "%H:%M:%S+%Z")) -> full_df
+```
+
+```{r} 
+#add level of offense
+full_df %>% 
+  mutate(level = if_else(OFFENSE == c("HOMICIDE", "SEX ABUSE", "ASSAULT w/DANGEROUS WEAPON", "ARSON"), true = "violence", false = "common crime")) -> full_df
+```
+
+
+```{r}
+load_variables(2018, "acs5", cache = T) -> acs18_5_vars
+acs18_5_vars %>% 
+  filter(str_detect(concept, "EDUCATIONAL ATTAINMENT")) 
+# MEDIAN INCOME - B06011_001
+# MEDIAN AGE - B01002_001
+# POVERTY STATUS IN THE PAST 12 MONTHS BY SEX BY AGE - B17001_001	
+# POVERTY STATUS IN THE PAST 12 MONTHS OF INDIVIDUALS BY SEX BY EDUCATIONAL ATTAINMENT - B17003_001
+# RACE - B02001_001
+# EDUCATIONAL ATTAINMENT FOR THE POPULATION 25 YEARS AND OVER - B15003_001
+# B23006_001 -  EDUCATIONAL ATTAINMENT BY EMPLOYMENT STATUS FOR THE POPULATION 25 TO 64 YEARS
+```
+
+```{r}
+# which factor changes how DC crime
+DC_median_age <- get_acs(state = "DC", county = "District of Columbia",
+                         geography = "tract",
+                         variables = "B01002_001",
+                         geometry = T,
+                         key = Sys.getenv("CENSUS_API_KEY_SECURE"))
+DC_median_income <- get_acs(state = "DC",county = "District of Columbia",
+              geography = "tract",
+              variables = "B06011_001",
+              geometry = TRUE,
+              key = Sys.getenv("CENSUS_API_KEY_SECURE")) 
+DC_edu <- get_acs(state = "DC",county = "District of Columbia",
+              geography = "tract",
+              variables = "B15003_001",
+              geometry = TRUE,
+              key = Sys.getenv("CENSUS_API_KEY_SECURE")) 
+DC_race <- get_acs(state = "DC",county = "District of Columbia",
+              geography = "tract",
+              variables = "B02001_001",
+              geometry = TRUE,
+              key = Sys.getenv("CENSUS_API_KEY_SECURE")) 
+
+DC_poverty <- get_acs(state = "DC", county = "District of Columbia",
+                         geography = "tract",
+                         variables = "B17001_001",
+                         geometry = T,
+                         key = Sys.getenv("CENSUS_API_KEY_SECURE"))
+
+
+DC_median_income %>%
+  mutate(CENSUS_TRACT = str_sub(GEOID,6,11)) ->
+DC_median_income
+
+DC_median_age %>%
+  mutate(CENSUS_TRACT = str_sub(GEOID,6,11)) ->
+DC_median_age
+
+DC_edu %>%
+  mutate(CENSUS_TRACT = str_sub(GEOID,6,11)) ->
+DC_edu
+
+DC_race %>% 
+   mutate(CENSUS_TRACT = str_sub(GEOID,6,11)) ->
+DC_race
+
+DC_poverty %>% 
+   mutate(CENSUS_TRACT = str_sub(GEOID,6,11)) ->
+DC_poverty
+```
+
+```{r}
+#liner regression model
+full_df %>% 
+  left_join(DC_median_income, "CENSUS_TRACT") %>% 
+  select(SHIFT, METHOD, level, CENSUS_TRACT, estimate) %>% 
+  mutate(income_estimate = estimate) %>% 
+  select(-estimate) %>% 
+  left_join(DC_edu, "CENSUS_TRACT") %>% 
+  select(SHIFT, METHOD, level, CENSUS_TRACT, estimate, income_estimate) %>% 
+  mutate(edu_estimate = estimate) %>% 
+  select(-estimate) %>%
+  left_join(DC_median_age, "CENSUS_TRACT") %>% 
+  select(SHIFT, METHOD, level, CENSUS_TRACT, estimate, income_estimate, edu_estimate) %>% 
+  mutate(age_estimate = estimate) %>% 
+  select(-estimate) %>%
+  left_join(DC_race, "CENSUS_TRACT") %>% 
+  select(SHIFT, METHOD, level, CENSUS_TRACT, estimate, income_estimate, edu_estimate, age_estimate) %>% 
+  mutate(race_estimate = estimate) %>% 
+  select(-estimate) %>% 
+  left_join(DC_poverty, "CENSUS_TRACT") %>% 
+  select(SHIFT, METHOD, level, CENSUS_TRACT, estimate, income_estimate, edu_estimate, age_estimate, race_estimate) %>% 
+  mutate(poverty_estimate = estimate) %>% 
+  select(-estimate) %>% 
+  group_by(CENSUS_TRACT, age_estimate, income_estimate, race_estimate, edu_estimate, poverty_estimate) %>% 
+  summarise(total_crime_num = n()) %>% 
+  ungroup() %>% 
+  select(-CENSUS_TRACT) -> lm_df 
+  
+lm(total_crime_num ~ ., data = lm_df)
+```
+
+
+```{r}
+# how median age affect crime
+full_df %>% 
+  group_by(CENSUS_TRACT, level, SHIFT) %>% 
+  count() %>% 
+  left_join(DC_median_age) %>% 
+  ggplot(aes(fill = n)) +
+  geom_sf(aes(geometry = geometry), color = NA) +
+  coord_sf(crs = 26915) +
+  scale_fill_viridis_c() +
+  facet_wrap(level~SHIFT)
+DC_median_age %>%
+  ggplot(aes(fill = estimate)) +
+  geom_sf(aes(geometry = geometry),color = NA) +
+  coord_sf(crs = 26915) + 
+  scale_fill_viridis_c() #side by side map chart can compare
+
+#DC_median_income %>%
+  #ggplot(aes(fill = estimate)) +
+  #geom_sf(aes(geometry = geometry),color = NA) +
+  #coord_sf(crs = 26915) + 
+  #scale_fill_viridis_c()
+
+#DC_median_edu %>%
+  #ggplot(aes(fill = estimate)) +
+  #geom_sf(aes(geometry = geometry),color = NA) +
+  #coord_sf(crs = 26915) + 
+  #scale_fill_viridis_c()
+```
+
+*How does crime vary by OFFENSE?
+```{r}
+wards <- read_sf("./Ward_from_2012.csv")
+wards%>%
+  mutate(WARD=parse_factor(as.character(WARD))) ->wards 
+
+full_df %>% 
+  mutate(WARD = parse_factor(as.character(WARD))) -> full_df
+
+full_df%>%
+  group_by(WARD, OFFENSE)%>%
+  count()%>%
+  left_join(wards)%>%
+  ggplot(aes(fill = n))+
+  geom_sf(aes(geometry = geometry),color = NA)+
+  coord_sf(crs = 26915)+
+  scale_fill_viridis_c()+facet_wrap(~OFFENSE)
+
+full_df%>%
+  group_by(WARD, level)%>%
+  count()%>%
+  left_join(wards)%>%
+  ggplot(aes(fill = n))+
+  geom_sf(aes(geometry = geometry),color = NA)+
+  coord_sf(crs = 26915)+
+  scale_fill_viridis_c()+facet_wrap(~level)
+```
+
+*How does crime vary by DISTRICT?
+```{r}
+au_latlong <- data.frame(longitude = -77.0888, latitude = 38.9375)
+au_latlong<- st_as_sf(au_latlong, coords = c("longitude", "latitude"),
+crs = 4326, agr = "constant")
+library(sf)
+Police_Districts<- read_sf("./Police_Districts-shp")
+Police_Districts %>%
+  mutate(DISTRICT=parse_factor(as.character(DISTRICT))) ->
+  Police_Districts
+full_df %>%
+  filter(!is.na(DISTRICT)) %>%
+  mutate(DISTRICT = parse_factor(as.character(DISTRICT), levels = levels(Police_Districts$DISTRICT)))  ->tempp
+
+tempp %>%
+  select(DISTRICT, crime_date) %>%
+  group_by(DISTRICT) %>%
+  summarize(n=n())%>%
+    ungroup() %>%
+  left_join(Police_Districts, by = "DISTRICT") -> temppp
+
+
+temppp %>%
+  ggplot(aes(fill=n))+
+    geom_sf(aes(geometry=geometry),color=NA)+
+         coord_sf(crs=26915) +
+         scale_fill_viridis_c()+
+          geom_sf(data = au_latlong, size = 3, shape = 21, fill = "red")+
+  geom_sf_label(aes(geometry=geometry,label = DISTRICT), color = "red3",
+                size = 4, label.size = 0)
+```
+
+* Covid effect crime
+```{r}
+# covid
+us_covid_data <- read_csv("../R_data/us-counties.csv")
+glimpse(us_covid_data)
+us_covid_data %>% 
+  filter(state == "District of Columbia")
+# covid start at 2020-03-07
+# before covid mean crimes by month
+full_df %>% 
+  filter(crime_date < ymd(20200307)) %>% 
+  arrange(crime_date) %>% 
+  group_by(crime_date) %>% 
+  summarise(total_crimes = n()) %>% 
+  mutate(year = year(crime_date),
+         month = month(crime_date)) %>% 
+  group_by(year, month) %>% 
+  summarise(mean_crimes_by_month = mean(total_crimes)) ->
+  bf_covid_mean_crimes_by_month
+# after covid mean crimes by month
+full_df %>% 
+  filter(crime_date >= ymd(20200307)) %>% 
+  arrange(crime_date) %>% 
+  group_by(crime_date) %>% 
+  summarise(total_crimes = n()) %>% 
+  mutate(year = year(crime_date),
+         month = month(crime_date)) %>% 
+  group_by(year, month) %>% 
+  summarise(mean_crimes_by_month = mean(total_crimes)) ->
+  af_covid_mean_crimes_by_month
+# see the difference
+# bf_covid_mean_crimes_by_month
+# af_covid_mean_crimes_by_month
+```
+
+```{r}
+bf_covid_mean_crimes_by_month %>% 
+  filter(!(year == 2020 & month == 3 )) ->
+  bf_covid_mean_crimes_by_month
+bind_rows(bf_covid_mean_crimes_by_month, af_covid_mean_crimes_by_month) ->
+  covid_effect
+# covid_effect
+covid_effect %>% 
+  mutate(year_month = make_date(
+    year = year,
+    month = month
+  )) %>% 
+  ggplot(aes(x = year_month, y = mean_crimes_by_month)) +
+  geom_line() +
+  theme_bw() +
+  ggtitle("Average Crime v.s. Time") +
+  xlab("Time") +
+  ylab("Average Crime")
+```
+
+```{r}
+#Has covid-19 effect time of day of crime? 
+full_df %>% 
+  mutate(before_after = if_else(condition = crime_date >= ymd(20200307), true = "after_covid", false = "before_covid"), month = month(crime_date), year = year(crime_date)) %>% 
+  filter(before_after == "before_covid", !(year == 2020 & month == 3 )) -> bf_covid_df
+full_df %>% 
+   mutate(before_after = if_else(condition = crime_date >= ymd(20200307), true = "after_covid", false = "before_covid"), month = month(crime_date), year = year(crime_date)) %>%
+  filter(before_after =="after_covid") -> af_covid_df
+bind_rows(af_covid_df, bf_covid_df)-> full_df
+
+full_df %>% 
+  mutate(year_month = make_date(year = year, month = month)) %>% 
+  group_by(before_after, METHOD, year_month, SHIFT) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x= before_after, y = n, color = before_after)) +
+  geom_boxplot()+
+  facet_wrap(METHOD~SHIFT, scales = "free")
+
+full_df %>% 
+  mutate(year_month = make_date(year = year, month = month)) %>% 
+  group_by(before_after, level, year_month, SHIFT) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x= before_after, y = n, color = before_after)) +
+  geom_boxplot()+
+  facet_wrap(level~SHIFT, scales = "free")
+  # maybe run t-test on violence crime
+```
